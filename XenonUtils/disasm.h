@@ -1,29 +1,22 @@
 #pragma once
-#include <dis-asm.h>
-#include <ppc.h>
+#include <cstddef>
+#include <cstdint>
+#include <ppc_decoder.h>
+#include <ppc-inst.h>
 
 namespace ppc
 {
-    struct DisassemblerEngine
-    {
-        disassemble_info info{};
-        DisassemblerEngine(const DisassemblerEngine&) = default;
-        DisassemblerEngine& operator=(const DisassemblerEngine&) = delete;
-
-        DisassemblerEngine(bfd_endian endian, const char* options);
-        ~DisassemblerEngine() = default;
-
-        /**
-         * \return Numbers of bytes decoded
-         */
-        int Disassemble(const void* code, size_t size, uint64_t base, ppc_insn& out);
-    };
-
-    thread_local extern DisassemblerEngine gBigEndianDisassembler;
-
+    // The PowerPC decoder is the host project's own (ppc_decoder.h); it fills the same ppc_insn as before.
     static int Disassemble(const void* code, size_t size, uint64_t base, ppc_insn& out)
     {
-        return gBigEndianDisassembler.Disassemble(code, size, base, out);
+        if (size < 4)
+        {
+            return 0;
+        }
+
+        const uint8_t* bytes = static_cast<const uint8_t*>(code);
+        const uint32_t word = uint32_t(bytes[0]) << 24 | uint32_t(bytes[1]) << 16 | uint32_t(bytes[2]) << 8 | bytes[3];
+        return DecodeWord(word, base, out);
     }
 
     static int Disassemble(const void* code, uint64_t base, ppc_insn& out)

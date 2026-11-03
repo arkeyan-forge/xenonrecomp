@@ -140,7 +140,8 @@ void MakeMask(const uint32_t* instructions, size_t count)
     for (size_t i = 0; i < count; i++)
     {
         ppc::Disassemble(&instructions[i], 0, insn);
-        fmt::println("0x{:X}, // {}", ByteSwap(insn.opcode->opcode | (insn.instruction & insn.opcode->mask)), insn.opcode->name);
+        // The decoder keeps no opcode masks: the whole word is the pattern (a stricter mask than the old opcode bits).
+        fmt::println("0x{:X}, // {}", ByteSwap(insn.instruction), insn.opcode != nullptr ? insn.opcode->name : "?");
     }
 }
 

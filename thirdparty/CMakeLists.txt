@@ -1,5 +1,3 @@
-add_subdirectory(${THIRDPARTY_ROOT}/disasm)
-
 if (NOT TARGET fmt::fmt)
     add_subdirectory(${THIRDPARTY_ROOT}/fmt)
 endif()
