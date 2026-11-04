@@ -1963,6 +1963,10 @@ bool Recompiler::Recompile(
         println("\tsimde_mm_store_si128((simde__m128i*){}.u16, simde_mm_add_epi16(simde_mm_load_si128((simde__m128i*){}.u16), simde_mm_load_si128((simde__m128i*){}.u16)));", v(insn.operands[0]), v(insn.operands[1]), v(insn.operands[2]));
         break;
 
+    case PPC_INST_VADDUHS:
+        println("\tsimde_mm_store_si128((simde__m128i*){}.u16, simde_mm_adds_epu16(simde_mm_load_si128((simde__m128i*){}.u16), simde_mm_load_si128((simde__m128i*){}.u16)));", v(insn.operands[0]), v(insn.operands[1]), v(insn.operands[2]));
+        break;
+
     case PPC_INST_VADDUWM:
         println("\tsimde_mm_store_si128((simde__m128i*){}.u32, simde_mm_add_epi32(simde_mm_load_si128((simde__m128i*){}.u32), simde_mm_load_si128((simde__m128i*){}.u32)));", v(insn.operands[0]), v(insn.operands[1]), v(insn.operands[2]));
         break;
@@ -2270,6 +2274,24 @@ bool Recompiler::Recompile(
     }
 
     case PPC_INST_VPKD3D128:
+    {
+        // One float of `source` (host lane) to a half in u16[`half`] of the destination, as the float16 formats pack.
+        auto packHalf = [&](const std::string& source, size_t lane, size_t half)
+        {
+            // Strip sign from source
+            println("\t{}.u32 = ({}.u32[{}]&0x7FFFFFFF);", temp(), source, lane);
+            // If |source| is > 65504, clamp output to 0x7FFF, else save 8 exponent bits
+            println("\t{0}.u8[0] = ({1}.f32 != {1}.f32) || ({1}.f32 > 65504.0f) ? 0xFF : (({2}.u32[{3}]&0x7f800000)>>23);", vTemp(), temp(), source, lane);
+            // If 8 exponent bits were saved, it can only be 0x8E at most
+            // If saved, save first 10 bits of mantissa
+            println("\t{}.u16 = {}.u8[0] != 0xFF ? (({}.u32[{}]&0x7FE000)>>13) : 0x0;", temp(), vTemp(), source, lane);
+            // If saved and > 127-15, exponent is converted from 8 to 5-bit by subtracting 0x70
+            // If saved but not > 127-15, clamp exponent at 0, add 0x400 to mantissa and shift right by (0x71-exponent)
+            // If right shift is greater than 31 bits, manually clamp mantissa to 0 or else the output of the shift will be wrong
+            println("\t{0}.u16[{1}] = {2}.u8[0] != 0xFF ? ({2}.u8[0] > 0x70 ? ((({2}.u8[0]-0x70)<<10)+{3}.u16) : (0x71-{2}.u8[0] > 31 ? 0x0 : ((0x400+{3}.u16)>>(0x71-{2}.u8[0])))) : 0x7FFF;", v(insn.operands[0]), half, vTemp(), temp());
+            // Add back original sign
+            println("\t{}.u16[{}] |= (({}.u32[{}]&0x80000000)>>16);", v(insn.operands[0]), half, source, lane);
+        };
         // TODO: vectorize somehow?
         // NOTE: handling vector reversal here too
         printSetFlushMode(true);
@@ -2289,26 +2311,23 @@ bool Recompiler::Recompile(
             println("\t{}.u32[{}] = {}.u32;", v(insn.operands[0]), insn.operands[4], temp());
             break;
 
+        case 3: // float16_2, the inverse of vupkd3d128's: x (element 0) to the high half of word `shift`, y to the low half
+            if (insn.operands[3] != 1)
+                fmt::println("Unexpected float16_2 pack instruction at {:X}", base);
+
+            // x and y first into vTemp (its u8[0] is lane 0): the destination may be the source
+            println("\t{}.u32[3] = {}.u32[3];", vTemp(), v(insn.operands[1]));
+            println("\t{}.u32[2] = {}.u32[2];", vTemp(), v(insn.operands[1]));
+            packHalf(vTemp(), 3, 2 * insn.operands[4] + 1);
+            packHalf(vTemp(), 2, 2 * insn.operands[4]);
+            break;
+
         case 5: // float16_4
             if ((insn.operands[3] != 2 && insn.operands[3] != 3) || insn.operands[4] > 2)
                 fmt::println("Unexpected float16_4 pack instruction at {:X}", base);
 
             for (size_t i = 0; i < 4; i++)
-            {
-        		// Strip sign from source
-        		println("\t{}.u32 = ({}.u32[{}]&0x7FFFFFFF);", temp(), v(insn.operands[1]), i);
-        		// If |source| is > 65504, clamp output to 0x7FFF, else save 8 exponent bits 
-        		println("\t{0}.u8[0] = ({1}.f32 != {1}.f32) || ({1}.f32 > 65504.0f) ? 0xFF : (({2}.u32[{3}]&0x7f800000)>>23);", vTemp(), temp(), v(insn.operands[1]), i);
-        		// If 8 exponent bits were saved, it can only be 0x8E at most
-        		// If saved, save first 10 bits of mantissa
-        		println("\t{}.u16 = {}.u8[0] != 0xFF ? (({}.u32[{}]&0x7FE000)>>13) : 0x0;", temp(), vTemp(), v(insn.operands[1]), i);
-        		// If saved and > 127-15, exponent is converted from 8 to 5-bit by subtracting 0x70
-        		// If saved but not > 127-15, clamp exponent at 0, add 0x400 to mantissa and shift right by (0x71-exponent)
-        		// If right shift is greater than 31 bits, manually clamp mantissa to 0 or else the output of the shift will be wrong
-        		println("\t{0}.u16[{1}] = {2}.u8[0] != 0xFF ? ({2}.u8[0] > 0x70 ? ((({2}.u8[0]-0x70)<<10)+{3}.u16) : (0x71-{2}.u8[0] > 31 ? 0x0 : ((0x400+{3}.u16)>>(0x71-{2}.u8[0])))) : 0x7FFF;", v(insn.operands[0]), i+(2*insn.operands[4]), vTemp(), temp());
-        		// Add back original sign
-        		println("\t{}.u16[{}] |= (({}.u32[{}]&0x80000000)>>16);", v(insn.operands[0]), i+(2*insn.operands[4]), v(insn.operands[1]), i);
-            }
+                packHalf(v(insn.operands[1]), i, i + (2 * insn.operands[4]));
             break;
 
         default:
@@ -2316,6 +2335,7 @@ bool Recompiler::Recompile(
             break;
         }
         break;
+    }
 
     case PPC_INST_VPKSHUS:
     case PPC_INST_VPKSHUS128:
@@ -2325,6 +2345,12 @@ bool Recompiler::Recompile(
     case PPC_INST_VPKSWSS:
     case PPC_INST_VPKSWSS128:
         println("\tsimde_mm_store_si128((simde__m128i*){}.u8, simde_mm_packs_epi32(simde_mm_load_si128((simde__m128i*){}.s32), simde_mm_load_si128((simde__m128i*){}.s32)));", v(insn.operands[0]), v(insn.operands[2]), v(insn.operands[1]));
+        break;
+
+    case PPC_INST_VPKUWUM:
+    case PPC_INST_VPKUWUM128:
+        // Modulo pack: the low halves of the words; masked first, so the saturating pack cannot saturate.
+        println("\tsimde_mm_store_si128((simde__m128i*){}.u16, simde_mm_packus_epi32(simde_mm_and_si128(simde_mm_load_si128((simde__m128i*){}.u32), simde_mm_set1_epi32(0xFFFF)), simde_mm_and_si128(simde_mm_load_si128((simde__m128i*){}.u32), simde_mm_set1_epi32(0xFFFF))));", v(insn.operands[0]), v(insn.operands[2]), v(insn.operands[1]));
         break;
 
     case PPC_INST_VREFP:
