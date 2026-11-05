@@ -58,12 +58,6 @@ void RecompilerConfig::Load(const std::string_view& configFilePath)
             }
         }
 
-        if (auto contextArray = main["context_functions"].as_array())
-        {
-            for (auto& address : *contextArray)
-                contextFunctions.emplace(*address.value<uint32_t>());
-        }
-
         if (auto invalidArray = main["invalid_instructions"].as_array())
         {
             for (auto& instr : *invalidArray)

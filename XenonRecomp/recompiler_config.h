@@ -1,5 +1,4 @@
 #pragma once
-#include <unordered_set>
 
 struct RecompilerSwitchTable
 {
@@ -51,8 +50,6 @@ struct RecompilerConfig
     uint32_t longJmpAddress = 0;
     uint32_t setJmpAddress = 0;
     std::unordered_map<uint32_t, uint32_t> functions;
-    // Translated with every register in the context although the *_as_local options are on (Recompiler::contextFunctions).
-    std::unordered_set<uint32_t> contextFunctions;
     std::unordered_map<uint32_t, uint32_t> invalidInstructions;
     std::unordered_map<uint32_t, RecompilerMidAsmHook> midAsmHooks;
 

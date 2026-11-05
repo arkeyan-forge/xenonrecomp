@@ -1,5 +1,4 @@
 #pragma once
-#include <unordered_set>
 
 #include "pch.h"
 #include "recompiler_config.h"
@@ -35,13 +34,6 @@ struct Recompiler
     std::string out;
     size_t cppFileIndex = 0;
     RecompilerConfig config;
-    // Functions translated with every register in the context even when the *_as_local options are on: the ones that
-    // read a register their caller set outside the ABI (FindContextFunctions). A call to one from a function with
-    // locals stores its locals to the context before and reads them back after.
-    std::unordered_set<uint32_t> contextFunctions;
-    bool contextOnly = false;
-
-    void FindContextFunctions();
 
     bool LoadConfig(const std::string_view& configFilePath);
 
