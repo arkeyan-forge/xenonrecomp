@@ -268,8 +268,8 @@ bool Recompiler::Recompile(
     // TODO: we could cache these formats in an array
     auto r = [&](size_t index)
         {
-            if ((config.nonArgumentRegistersAsLocalVariables && (index == 0 || index == 2 || index == 11 || index == 12)) || 
-                (config.nonVolatileRegistersAsLocalVariables && index >= 14))
+            if (!contextOnly && ((config.nonArgumentRegistersAsLocalVariables && (index == 0 || index == 2 || index == 11 || index == 12)) ||
+                (config.nonVolatileRegistersAsLocalVariables && index >= 14)))
             {
                 localVariables.r[index] = true;
                 return fmt::format("r{}", index);
@@ -279,8 +279,8 @@ bool Recompiler::Recompile(
 
     auto f = [&](size_t index)
         {
-            if ((config.nonArgumentRegistersAsLocalVariables && index == 0) ||
-                (config.nonVolatileRegistersAsLocalVariables && index >= 14))
+            if (!contextOnly && ((config.nonArgumentRegistersAsLocalVariables && index == 0) ||
+                (config.nonVolatileRegistersAsLocalVariables && index >= 14)))
             {
                 localVariables.f[index] = true;
                 return fmt::format("f{}", index);
@@ -290,8 +290,8 @@ bool Recompiler::Recompile(
 
     auto v = [&](size_t index)
         {
-            if ((config.nonArgumentRegistersAsLocalVariables && (index >= 32 && index <= 63)) ||
-                (config.nonVolatileRegistersAsLocalVariables && ((index >= 14 && index <= 31) || (index >= 64 && index <= 127))))
+            if (!contextOnly && ((config.nonArgumentRegistersAsLocalVariables && (index >= 32 && index <= 63)) ||
+                (config.nonVolatileRegistersAsLocalVariables && ((index >= 14 && index <= 31) || (index >= 64 && index <= 127)))))
             {
                 localVariables.v[index] = true;
                 return fmt::format("v{}", index);
@@ -301,7 +301,7 @@ bool Recompiler::Recompile(
 
     auto cr = [&](size_t index)
         {
-            if (config.crRegistersAsLocalVariables)
+            if (!contextOnly && config.crRegistersAsLocalVariables)
             {
                 localVariables.cr[index] = true;
                 return fmt::format("cr{}", index);
@@ -311,7 +311,7 @@ bool Recompiler::Recompile(
 
     auto ctr = [&]()
         {
-            if (config.ctrAsLocalVariable)
+            if (!contextOnly && config.ctrAsLocalVariable)
             {
                 localVariables.ctr = true;
                 return "ctr";
@@ -321,7 +321,7 @@ bool Recompiler::Recompile(
 
     auto xer = [&]()
         {
-            if (config.xerAsLocalVariable)
+            if (!contextOnly && config.xerAsLocalVariable)
             {
                 localVariables.xer = true;
                 return "xer";
@@ -331,7 +331,7 @@ bool Recompiler::Recompile(
 
     auto reserved = [&]()
         {
-            if (config.reservedRegisterAsLocalVariable)
+            if (!contextOnly && config.reservedRegisterAsLocalVariable)
             {
                 localVariables.reserved = true;
                 return "reserved";
@@ -388,9 +388,16 @@ bool Recompiler::Recompile(
 
                 if (targetSymbol != image.symbols.end() && targetSymbol->address == address && targetSymbol->type == Symbol_Function)
                 {
-                    if (config.nonVolatileRegistersAsLocalVariables && (targetSymbol->name.find("__rest") == 0 || targetSymbol->name.find("__save") == 0))
+                    if (!contextOnly && config.nonVolatileRegistersAsLocalVariables && (targetSymbol->name.find("__rest") == 0 || targetSymbol->name.find("__save") == 0))
                     {
                         // print nothing
+                    }
+                    else if (!contextOnly && contextFunctions.count(address) != 0)
+                    {
+                        // Replaced by the stores and loads of this function's locals once they are known.
+                        println("\t$CONTEXT_STORE$");
+                        println("\t{}(ctx, base);", targetSymbol->name);
+                        println("\t$CONTEXT_LOAD$");
                     }
                     else
                     {
@@ -1440,6 +1447,12 @@ bool Recompiler::Recompile(
 
     case PPC_INST_MULHW:
         println("\t{}.s64 = (int64_t({}.s32) * int64_t({}.s32)) >> 32;", r(insn.operands[0]), r(insn.operands[1]), r(insn.operands[2]));
+        break;
+
+    case PPC_INST_MULHD:
+        println("\t{}.s64 = int64_t((__int128)({}.s64) * {}.s64 >> 64);", r(insn.operands[0]), r(insn.operands[1]), r(insn.operands[2]));
+        if (strchr(insn.opcode->name, '.'))
+            println("\t{}.compare<int64_t>({}.s64, 0, {});", cr(0), r(insn.operands[0]), xer());
         break;
 
     case PPC_INST_MULHDU:
@@ -2665,6 +2678,51 @@ bool Recompiler::Recompile(
     return true;
 }
 
+void Recompiler::FindContextFunctions()
+{
+    contextFunctions = config.contextFunctions;
+    if (!config.nonArgumentRegistersAsLocalVariables && !config.nonVolatileRegistersAsLocalVariables)
+        return;
+
+    for (auto& fn : functions)
+    {
+        auto symbol = image.symbols.find(fn.base);
+        // The register save and restore helpers work on their caller's registers.
+        if (symbol != image.symbols.end() && (symbol->name.find("__save") == 0 || symbol->name.find("__rest") == 0))
+        {
+            contextFunctions.emplace(fn.base);
+            continue;
+        }
+
+        // An exception-handler funclet (a __finally block, which the parent also calls on its normal path) starts by
+        // reading r12, its parent's frame, and then uses the parent's non-volatile registers: the parent's values, kept
+        // in the context around that call. Its prologue reads r12 before anything writes it; any other function's
+        // first use of r12 is mflr r12 (a write).
+        auto* data = (const uint32_t*)image.Find(fn.base);
+        if (data == nullptr)
+            continue;
+        for (size_t i = 0; i < 8 && i * 4 < fn.size; i++)
+        {
+            uint32_t word = ByteSwap(data[i]);
+            uint32_t op = word >> 26;
+            uint32_t rd = (word >> 21) & 31;
+            uint32_t ra = (word >> 16) & 31;
+            // addi, lwz, stw, lfd, stfd, ld/std: a base register or source operand rA
+            bool readsR12 = ra == 12 && (op == 14 || op == 32 || op == 36 || op == 50 || op == 54 || op == 58 || op == 62);
+            if (readsR12)
+            {
+                contextFunctions.emplace(fn.base);
+                break;
+            }
+            bool branch = op == 16 || op == 18 || op == 19;
+            bool writesR12 = word == 0x7D8802A6 || (rd == 12 && (op == 14 || op == 15 || op == 32 || op == 58));
+            if (branch || writesR12)
+                break;
+        }
+    }
+    fmt::println("{} functions keep every register in the context", contextFunctions.size());
+}
+
 bool Recompiler::Recompile(const Function& fn)
 {
     auto base = fn.base;
@@ -2774,6 +2832,7 @@ bool Recompiler::Recompile(const Function& fn)
     auto switchTable = config.switchTables.end();
     bool allRecompiled = true;
     CSRState csrState = CSRState::Unknown;
+    contextOnly = contextFunctions.count(fn.base) != 0;
 
     // TODO: the printing scheme here is scuffed
     RecompilerLocalVariables localVariables;
@@ -2877,6 +2936,43 @@ bool Recompiler::Recompile(const Function& fn)
 
     if (localVariables.ea)
         println("\tuint32_t ea{{}};");
+
+    if (tempString.find("$CONTEXT_STORE$") != std::string::npos)
+    {
+        // The context's own values are put back after the call: a caller up the stack that keeps its registers in the
+        // context (a context function) still owns them.
+        std::string store = "{ ", load;
+        auto both = [&](const std::string& name)
+            {
+                store += fmt::format("auto saved_{0} = ctx.{0}; ctx.{0} = {0}; ", name);
+                load += fmt::format("{0} = ctx.{0}; ctx.{0} = saved_{0}; ", name);
+            };
+        if (localVariables.ctr)
+            both("ctr");
+        if (localVariables.xer)
+            both("xer");
+        if (localVariables.reserved)
+            both("reserved");
+        for (size_t i = 0; i < 8; i++)
+            if (localVariables.cr[i])
+                both(fmt::format("cr{}", i));
+        for (size_t i = 0; i < 32; i++)
+            if (localVariables.r[i])
+                both(fmt::format("r{}", i));
+        for (size_t i = 0; i < 32; i++)
+            if (localVariables.f[i])
+                both(fmt::format("f{}", i));
+        for (size_t i = 0; i < 128; i++)
+            if (localVariables.v[i])
+                both(fmt::format("v{}", i));
+        auto replace = [&](std::string_view marker, const std::string& code)
+            {
+                for (size_t at; (at = tempString.find(marker)) != std::string::npos;)
+                    tempString.replace(at, marker.size(), code);
+            };
+        replace("$CONTEXT_STORE$", store);
+        replace("$CONTEXT_LOAD$", load + "}");
+    }
 
     out += tempString;
 
@@ -2984,6 +3080,8 @@ void Recompiler::Recompile(const std::filesystem::path& headerFilePath)
 
         SaveCurrentOutData("ppc_func_mapping.cpp");
     }
+
+    FindContextFunctions();
 
     for (size_t i = 0; i < functions.size(); i++)
     {
